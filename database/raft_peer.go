@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+type batchOp struct {
+	err chan<- error
+	cmd raft.Command
+}
+
 type RaftPeer struct {
 	name          string
 	host          string
@@ -21,7 +26,7 @@ type RaftPeer struct {
 	leaderAddress string
 	raftServer    *raft.Server
 	db            *Database
-	batchChannel  chan raft.Command
+	batchChannel  chan batchOp
 }
 
 type call struct {
@@ -150,20 +155,26 @@ func (raftPeer *RaftPeer) Join(leader string) error {
 }
 
 func (raftPeer *RaftPeer) StartBatching() {
-	raftPeer.batchChannel = make(chan raft.Command, 1024)
+	raftPeer.batchChannel = make(chan batchOp, 1024)
 	c := raftPeer.batchChannel
 
 	go func() {
 		for {
+			var errors []chan<- error
 			txn := &TransactionBatchCommand{Commands: []raft.Command{}}
 
 			// this avoids busy loop
-			txn.Commands = append(txn.Commands, <-c)
+			{
+				bop := <-c
+				txn.Commands = append(txn.Commands, bop.cmd)
+				errors = append(errors, bop.err)
+			}
 		fill:
 			for {
 				select {
-				case command := <-c:
-					txn.Commands = append(txn.Commands, command)
+				case bop := <-c:
+					txn.Commands = append(txn.Commands, bop.cmd)
+					errors = append(errors, bop.err)
 					if len(txn.Commands) > 100 {
 						break fill
 					}
@@ -174,31 +185,18 @@ func (raftPeer *RaftPeer) StartBatching() {
 			}
 
 			_, err := raftPeer.raftServer.Do(txn)
-
-			for _, command := range txn.Commands {
-				if command, ok := command.(*SetCommand); ok {
-					command.C <- err
-				}
+			for _, errch := range errors {
+				errch <- err
 			}
 		}
 	}()
 }
 
 func (raftPeer *RaftPeer) ExecuteCommand(command raft.Command) error {
-	// Execute the command against the Raft server.
-	//_, err := raftPeer.raftServer.Do(command)
-	//return err
+	// Send command to be batched.
+	errch := make(chan error, 1)
+	raftPeer.batchChannel <- batchOp{cmd: command, err: errch}
 
-	if command, ok := command.(*SetCommand); ok {
-		// Send command to be batched.
-		raftPeer.batchChannel <- command
-
-		// Receive the error, if any, for the transaction.
-		err := <-command.C
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	// Receive the error, if any, for the transaction.
+	return <-errch
 }

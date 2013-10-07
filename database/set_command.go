@@ -39,13 +39,12 @@ type Operation struct {
 }
 
 type SetCommand struct {
-	C    chan error
 	Type string
 	Ops  []Operation
 }
 
 func NewSetCommand() *SetCommand {
-	return &SetCommand{C: make(chan error)}
+	return &SetCommand{}
 }
 
 // The name of the command in the log.
